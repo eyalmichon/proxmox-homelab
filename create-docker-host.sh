@@ -24,6 +24,7 @@ RAM="1024"
 CORES="2"
 STORAGE="local-lvm"
 BRIDGE="vmbr0"
+PASSWORD="$(openssl rand -base64 12 2>/dev/null || echo "changeme123")"
 
 # ── Gather settings ──────────────────────────────────────────────────────────
 header "Docker Host LXC Setup"
@@ -81,6 +82,7 @@ header "Creating LXC $CT_ID ($HOSTNAME)"
 
 pct create "$CT_ID" "$TMPL" \
   --hostname "$HOSTNAME" \
+  --password "$PASSWORD" \
   --storage "$STORAGE" \
   --rootfs "${STORAGE}:${DISK_SIZE}" \
   --memory "$RAM" \
@@ -146,8 +148,11 @@ header "Done! Docker host ready"
 echo ""
 echo -e " ${GN}Container:${CL}  $CT_ID ($HOSTNAME)"
 echo -e " ${GN}IP:${CL}         ${CT_IP:-check DHCP}"
+echo -e " ${GN}Login:${CL}      root / ${YW}${PASSWORD}${CL}"
 echo -e " ${GN}Console:${CL}    Proxmox UI → $CT_ID → Console"
 echo -e " ${GN}Services:${CL}   /opt/services/"
+echo ""
+echo -e " ${RD}Save the password above — change it later with: passwd${CL}"
 echo ""
 echo -e " ${YW}To deploy a service, open the LXC console and run its one-liner.${CL}"
 echo ""
