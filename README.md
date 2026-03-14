@@ -18,11 +18,11 @@ This creates a Debian 12 LXC with Docker + Compose, ready to host services.
 
 ### Deploying services
 
-Open the Docker host **LXC console** (Proxmox UI → container → Console) and run the service's one-liner:
+Open the container's **Shell** in Proxmox (auto-logs in as root) and run the service one-liner:
 
-| Service | One-liner |
-|---|---|
-| [magic-files](https://github.com/eyalmichon/magic-files) | `bash -c "$(wget -qLO - https://raw.githubusercontent.com/eyalmichon/magic-files/main/scripts/deploy.sh)"` |
+| Service | One-liner | Description |
+|---|---|---|
+| [magic-files](https://github.com/eyalmichon/magic-files) | `bash -c "$(wget -qLO - https://raw.githubusercontent.com/eyalmichon/magic-files/main/scripts/deploy.sh)"` | Telegram PDF-to-Drive bot |
 
 ### Useful commands
 

@@ -136,6 +136,18 @@ services: {}
 EOF'
 msg "/opt/services ready"
 
+# ── Auto-login on console ─────────────────────────────────────────────────────
+GETTY_OVERRIDE="/etc/systemd/system/container-getty@1.service.d/override.conf"
+lxc_exec "mkdir -p $(dirname $GETTY_OVERRIDE)"
+pct exec "$CT_ID" -- bash -c "cat > $GETTY_OVERRIDE << 'OVER'
+[Service]
+ExecStart=
+ExecStart=-/sbin/agetty --autologin root --noclear --keep-baud tty%I 115200,38400,9600 \$TERM
+OVER"
+lxc_exec "systemctl daemon-reload"
+lxc_exec "systemctl restart container-getty@1.service 2>/dev/null || true"
+msg "Console auto-login enabled"
+
 # ── Verify Docker ────────────────────────────────────────────────────────────
 header "Verifying Docker"
 lxc_exec "docker run --rm hello-world > /dev/null 2>&1" && msg "Docker is working" || info "Docker test failed — may need manual check"
@@ -148,11 +160,9 @@ header "Done! Docker host ready"
 echo ""
 echo -e " ${GN}Container:${CL}  $CT_ID ($HOSTNAME)"
 echo -e " ${GN}IP:${CL}         ${CT_IP:-check DHCP}"
-echo -e " ${GN}Login:${CL}      root / ${YW}${PASSWORD}${CL}"
-echo -e " ${GN}Console:${CL}    Proxmox UI → $CT_ID → Console"
+echo -e " ${GN}Console:${CL}    Proxmox UI → $CT_ID → Shell (auto-login as root)"
+echo -e " ${GN}Password:${CL}   ${YW}${PASSWORD}${CL} (for SSH — change with: passwd)"
 echo -e " ${GN}Services:${CL}   /opt/services/"
 echo ""
-echo -e " ${RD}Save the password above — change it later with: passwd${CL}"
-echo ""
-echo -e " ${YW}To deploy a service, open the LXC console and run its one-liner.${CL}"
+echo -e " ${YW}To deploy a service, open the Shell and run its one-liner.${CL}"
 echo ""
