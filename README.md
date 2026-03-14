@@ -8,23 +8,21 @@ All lightweight services (bots, tools) run as Docker containers inside a single 
 
 ### One-time setup
 
-Run on the Proxmox host:
+Run on the **Proxmox host** shell (web UI or SSH):
 
 ```bash
-bash create-docker-host.sh
+bash -c "$(wget -qLO - https://raw.githubusercontent.com/eyalmichon/proxmox-homelab/main/create-docker-host.sh)"
 ```
 
-This creates a Debian 12 LXC with Docker + Docker Compose, ready to host services.
+This creates a Debian 12 LXC with Docker + Compose, ready to host services.
 
 ### Deploying services
 
-Each service has its own repo with a `Dockerfile` and `scripts/deploy.sh`. Run the deploy one-liner from the Docker host LXC console and it handles the rest.
+Open the Docker host **LXC console** (Proxmox UI → container → Console) and run the service's one-liner:
 
-### Services
-
-| Service | Repo | Description |
-|---|---|---|
-| magic-files | [drive-bot](../drive-bot) | Telegram bot that files scanned PDFs into Google Drive |
+| Service | One-liner |
+|---|---|
+| [magic-files](https://github.com/eyalmichon/magic-files) | `bash -c "$(wget -qLO - https://raw.githubusercontent.com/eyalmichon/magic-files/main/scripts/deploy.sh)"` |
 
 ### Useful commands
 
