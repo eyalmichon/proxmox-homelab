@@ -137,7 +137,8 @@ generate_env() {
     [[ -n "$default" ]] && prompt_text="$prompt_text [$default]"
 
     local is_secret=false
-    if [[ "${description,,}" =~ password|secret|token|api.key ]]; then
+    if [[ "${key,,}" =~ password|secret|token|api.key ]] || \
+       [[ "${description,,}" =~ password|secret|token|api.key ]]; then
       is_secret=true
     fi
 
@@ -184,10 +185,10 @@ cmd_install() {
   local resuming=false
 
   if [[ -d "$dest" ]]; then
-    if is_installed "$svc" && [[ -f "$dest/.env" ]]; then
-      err "'$svc' already exists at $dest. Use 'homelab update $svc' instead."
+    if compose "$svc" ps -q 2>/dev/null | grep -q .; then
+      err "'$svc' is already running at $dest. Use 'homelab update $svc' instead."
     fi
-    info "Found incomplete install at $dest — resuming"
+    info "Found existing directory at $dest — resuming install"
     resuming=true
   fi
 
