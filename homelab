@@ -164,7 +164,7 @@ generate_env() {
       value="${value:-$default}"
     fi
 
-    env_lines+=("$key=$value")
+    env_lines+=("$key='$value'")
   done 3< "$example"
 
   printf '%s\n' "${env_lines[@]}" > "$target"
