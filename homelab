@@ -401,6 +401,22 @@ cmd_list() {
   echo
 }
 
+SELF_URL="https://raw.githubusercontent.com/eyalmichon/proxmox-homelab/main/homelab"
+
+cmd_self_update() {
+  header "Updating homelab CLI"
+  local tmp
+  tmp=$(mktemp)
+  if wget -qO "$tmp" "$SELF_URL"; then
+    mv "$tmp" /usr/local/bin/homelab
+    chmod +x /usr/local/bin/homelab
+    msg "homelab CLI updated"
+  else
+    rm -f "$tmp"
+    err "Download failed — check your internet connection"
+  fi
+}
+
 cmd_help() {
   echo -e "\n${BD}homelab${CL} — unified service management\n"
   echo "Usage:  homelab <command> [args]"
@@ -413,6 +429,7 @@ cmd_help() {
   printf "  ${GN}%-28s${CL} %s\n" "restart <service>"   "Restart a service"
   printf "  ${GN}%-28s${CL} %s\n" "backup [service]"    "Snapshot volumes to /opt/backups/"
   printf "  ${GN}%-28s${CL} %s\n" "list"                "List installed services"
+  printf "  ${GN}%-28s${CL} %s\n" "self-update"          "Update the homelab CLI itself"
   printf "  ${GN}%-28s${CL} %s\n" "help"                "Show this help"
   echo ""
   echo "Available services:"
@@ -434,8 +451,9 @@ case "$COMMAND" in
   status)  cmd_status  "$@" ;;
   logs)    cmd_logs     "$@" ;;
   restart) require_root; cmd_restart "$@" ;;
-  backup)  require_root; cmd_backup  "$@" ;;
-  list)    cmd_list    "$@" ;;
+  backup)       require_root; cmd_backup      "$@" ;;
+  self-update)  require_root; cmd_self_update "$@" ;;
+  list)         cmd_list    "$@" ;;
   help|--help|-h) cmd_help ;;
   *) err "Unknown command '$COMMAND'. Run: homelab help" ;;
 esac

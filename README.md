@@ -62,6 +62,7 @@ The CLI clones the repo, walks you through `.env` configuration, runs any setup 
 | `homelab restart <service>` | Restart a service |
 | `homelab backup [service]` | Snapshot named volumes to `/opt/backups/` |
 | `homelab list` | List installed services with repo URLs |
+| `homelab self-update` | Update the homelab CLI itself |
 | `homelab help` | Show help and available services |
 
 ## Available services
