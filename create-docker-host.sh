@@ -128,13 +128,12 @@ msg "Docker installed"
 lxc_exec "apt-get install -y -qq git rsync python3 > /dev/null 2>&1"
 msg "git, rsync, python3 installed"
 
-# ── Create services directory ────────────────────────────────────────────────
-header "Setting up /opt/services"
-lxc_exec "mkdir -p /opt/services"
-pct exec "$CT_ID" -- bash -c 'cat > /opt/services/docker-compose.yml << EOF
-services: {}
-EOF'
-msg "/opt/services ready"
+# ── Create services directory & install homelab CLI ──────────────────────────
+header "Setting up homelab CLI"
+lxc_exec "mkdir -p /opt/services /opt/backups"
+lxc_exec "wget -qO /usr/local/bin/homelab https://raw.githubusercontent.com/eyalmichon/proxmox-homelab/main/homelab"
+lxc_exec "chmod +x /usr/local/bin/homelab"
+msg "homelab CLI installed to /usr/local/bin/homelab"
 
 # ── Auto-login on console ─────────────────────────────────────────────────────
 GETTY_OVERRIDE="/etc/systemd/system/container-getty@1.service.d/override.conf"
@@ -163,6 +162,9 @@ echo -e " ${GN}IP:${CL}         ${CT_IP:-check DHCP}"
 echo -e " ${GN}Console:${CL}    Proxmox UI → $CT_ID → Shell (auto-login as root)"
 echo -e " ${GN}Password:${CL}   ${YW}${PASSWORD}${CL} (for SSH — change with: passwd)"
 echo -e " ${GN}Services:${CL}   /opt/services/"
+echo -e " ${GN}CLI:${CL}        homelab help"
 echo ""
-echo -e " ${YW}To deploy a service, open the Shell and run its one-liner.${CL}"
+echo -e " ${YW}To get started, open the Shell and run:${CL}"
+echo -e "   homelab install <service>   ${YW}# e.g. nanit-bridge, magic-files${CL}"
+echo -e "   homelab status              ${YW}# see running services${CL}"
 echo ""

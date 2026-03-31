@@ -1,0 +1,441 @@
+#!/usr/bin/env bash
+# ──────────────────────────────────────────────────────────────────────────────
+# homelab — unified service management for the Docker host LXC
+#
+# Usage:  homelab <command> [args]
+#         homelab help
+# ──────────────────────────────────────────────────────────────────────────────
+set -euo pipefail
+
+# ── Colors / output helpers ──────────────────────────────────────────────────
+GN="\033[1;32m" YW="\033[33m" BL="\033[36m" RD="\033[01;31m" BD="\033[1m" CL="\033[m"
+header() { echo -e "\n${BL}──── $1 ────${CL}"; }
+msg()    { echo -e " ${GN}✓${CL} $1"; }
+info()   { echo -e " ${YW}→${CL} $1"; }
+err()    { echo -e " ${RD}✗ $1${CL}" >&2; exit 1; }
+warn()   { echo -e " ${YW}! $1${CL}" >&2; }
+
+# ── Service registry ─────────────────────────────────────────────────────────
+declare -A REGISTRY=(
+  [nanit-bridge]="https://github.com/eyalmichon/nanit-bridge.git"
+  [magic-files]="https://github.com/eyalmichon/magic-files.git"
+)
+
+SERVICES_DIR="/opt/services"
+BACKUPS_DIR="/opt/backups"
+
+# ── Utility functions ────────────────────────────────────────────────────────
+
+require_root() {
+  [[ $(id -u) -eq 0 ]] || err "Run as root."
+}
+
+require_service_arg() {
+  [[ -n "${1:-}" ]] || err "Usage: homelab $COMMAND <service>"
+}
+
+service_dir() {
+  echo "$SERVICES_DIR/$1"
+}
+
+is_installed() {
+  [[ -d "$(service_dir "$1")" && -f "$(service_dir "$1")/docker-compose.yml" ]]
+}
+
+require_installed() {
+  is_installed "$1" || err "'$1' is not installed. Run: homelab install $1"
+}
+
+compose() {
+  local svc="$1"; shift
+  docker compose -f "$(service_dir "$svc")/docker-compose.yml" \
+    --project-directory "$(service_dir "$svc")" "$@"
+}
+
+run_hook() {
+  local svc="$1" hook="$2"
+  local script="$(service_dir "$svc")/scripts/$hook"
+  if [[ -x "$script" ]]; then
+    info "Running $hook …"
+    bash "$script"
+  fi
+}
+
+installed_services() {
+  local dirs=()
+  for d in "$SERVICES_DIR"/*/; do
+    [[ -f "$d/docker-compose.yml" ]] && dirs+=("$(basename "$d")")
+  done
+  echo "${dirs[@]}"
+}
+
+# ── .env.example parser ─────────────────────────────────────────────────────
+
+generate_env() {
+  local svc="$1"
+  local example="$(service_dir "$svc")/.env.example"
+  local target="$(service_dir "$svc")/.env"
+
+  if [[ ! -f "$example" ]]; then
+    warn "No .env.example found — skipping .env generation"
+    return 0
+  fi
+
+  if [[ -f "$target" ]]; then
+    read -rp " .env already exists. Overwrite? [y/N]: " ans
+    [[ "${ans,,}" == "y" ]] || return 0
+  fi
+
+  header "Configure $svc"
+  local section="required"
+  local env_lines=()
+
+  while IFS= read -r line <&3 || [[ -n "$line" ]]; do
+    # Detect section headers
+    if [[ "$line" =~ ^#\ *[Rr]equired ]]; then
+      section="required"
+      continue
+    fi
+    if [[ "$line" =~ ^#\ *[Oo]ptional ]]; then
+      section="optional"
+      continue
+    fi
+
+    # Skip blank lines and pure comment lines that aren't variable definitions
+    [[ -z "$line" ]] && continue
+
+    local commented=false
+    local work="$line"
+
+    # Handle commented-out variable definitions: # VAR=value
+    if [[ "$work" =~ ^#\ *([A-Za-z_][A-Za-z0-9_]*=) ]]; then
+      commented=true
+      work="${work#\#}"
+      work="${work#"${work%%[![:space:]]*}"}"
+    fi
+
+    # Only process lines that look like KEY=value
+    [[ "$work" =~ ^([A-Za-z_][A-Za-z0-9_]*)=(.*) ]] || continue
+
+    local key="${BASH_REMATCH[1]}"
+    local rest="${BASH_REMATCH[2]}"
+
+    # Separate value from inline comment
+    local default="" description=""
+    if [[ "$rest" =~ ^([^#]*)#\ *(.*) ]]; then
+      default="${BASH_REMATCH[1]}"
+      description="${BASH_REMATCH[2]}"
+    else
+      default="$rest"
+    fi
+    # Trim whitespace from default
+    default="${default%"${default##*[![:space:]]}"}"
+    default="${default#"${default%%[![:space:]]*}"}"
+
+    local prompt_text="$key"
+    [[ -n "$description" ]] && prompt_text="$key ($description)"
+    [[ -n "$default" ]] && prompt_text="$prompt_text [$default]"
+
+    local is_secret=false
+    if [[ "${description,,}" =~ password|secret|token|api.key ]]; then
+      is_secret=true
+    fi
+
+    local value=""
+    if [[ "$section" == "required" && "$commented" == false ]]; then
+      while true; do
+        if $is_secret; then
+          read -rsp "  ${prompt_text}: " value </dev/tty
+          echo
+        else
+          read -rp "  ${prompt_text}: " value </dev/tty
+        fi
+        value="${value:-$default}"
+        [[ -n "$value" ]] && break
+        warn "Required — cannot be empty"
+      done
+    else
+      if $is_secret; then
+        read -rsp "  ${prompt_text}: " value </dev/tty
+        echo
+      else
+        read -rp "  ${prompt_text}: " value </dev/tty
+      fi
+      value="${value:-$default}"
+    fi
+
+    env_lines+=("$key=$value")
+  done 3< "$example"
+
+  printf '%s\n' "${env_lines[@]}" > "$target"
+  msg ".env written (${#env_lines[@]} variables)"
+}
+
+# ── Commands ─────────────────────────────────────────────────────────────────
+
+cmd_install() {
+  local svc="${1:-}"
+  require_service_arg "$svc"
+
+  local repo="${REGISTRY[$svc]:-}"
+  [[ -n "$repo" ]] || err "Unknown service '$svc'. Known: ${!REGISTRY[*]}"
+
+  local dest="$(service_dir "$svc")"
+  [[ ! -d "$dest" ]] || err "'$svc' already exists at $dest. Use 'homelab update $svc' instead."
+
+  header "Installing $svc"
+
+  info "Cloning $repo …"
+  git clone --depth 1 "$repo" "$dest" 2>&1 | tail -1
+  msg "Cloned to $dest"
+
+  [[ -f "$dest/docker-compose.yml" ]] || err "Repo missing docker-compose.yml — not a compatible service."
+
+  generate_env "$svc"
+
+  run_hook "$svc" "post-install.sh"
+
+  info "Starting containers …"
+  compose "$svc" up -d
+  msg "$svc installed and running"
+}
+
+cmd_update() {
+  local targets=()
+  if [[ -n "${1:-}" ]]; then
+    targets=("$1")
+  else
+    read -ra targets <<< "$(installed_services)"
+    [[ ${#targets[@]} -gt 0 ]] || err "No services installed."
+    info "Updating all services: ${targets[*]}"
+  fi
+
+  for svc in "${targets[@]}"; do
+    require_installed "$svc"
+    header "Updating $svc"
+
+    local dest="$(service_dir "$svc")"
+    info "Pulling latest …"
+    git -C "$dest" pull --ff-only 2>&1 | tail -3
+    msg "Repository updated"
+
+    run_hook "$svc" "post-update.sh"
+
+    info "Rebuilding containers …"
+    compose "$svc" up -d --build
+    msg "$svc updated"
+  done
+}
+
+cmd_remove() {
+  local svc="${1:-}"
+  require_service_arg "$svc"
+  require_installed "$svc"
+
+  read -rp " Remove '$svc'? This will stop its containers. [y/N]: " confirm
+  [[ "${confirm,,}" == "y" ]] || { info "Aborted."; return 0; }
+
+  header "Removing $svc"
+
+  run_hook "$svc" "pre-remove.sh"
+
+  local remove_volumes=""
+  read -rp " Also remove Docker volumes? [y/N]: " remove_volumes
+  if [[ "${remove_volumes,,}" == "y" ]]; then
+    compose "$svc" down -v
+  else
+    compose "$svc" down
+  fi
+  msg "Containers stopped"
+
+  read -rp " Delete the repo directory $(service_dir "$svc")? [y/N]: " del_dir
+  if [[ "${del_dir,,}" == "y" ]]; then
+    rm -rf "$(service_dir "$svc")"
+    msg "Directory removed"
+  else
+    info "Directory kept at $(service_dir "$svc")"
+  fi
+
+  msg "$svc removed"
+}
+
+cmd_status() {
+  header "Service Status"
+
+  local services
+  read -ra services <<< "$(installed_services)"
+
+  if [[ ${#services[@]} -eq 0 ]]; then
+    info "No services installed. Run: homelab install <service>"
+    return 0
+  fi
+
+  printf "\n ${BD}%-20s %-12s %-10s %-12s %s${CL}\n" "SERVICE" "STATE" "HEALTH" "UPTIME" "PORTS"
+  printf " %-20s %-12s %-10s %-12s %s\n" "-------" "-----" "------" "------" "-----"
+
+  for svc in "${services[@]}"; do
+    local state="" health="" uptime="" ports=""
+
+    local json
+    json=$(compose "$svc" ps --format json 2>/dev/null) || true
+
+    if [[ -z "$json" ]]; then
+      printf " %-20s ${RD}%-12s${CL} %-10s %-12s %s\n" "$svc" "stopped" "-" "-" "-"
+      continue
+    fi
+
+    # docker compose ps --format json may output one JSON object per line
+    while IFS= read -r obj; do
+      [[ -z "$obj" ]] && continue
+      local name state health_val running_for published
+
+      name=$(echo "$obj" | grep -o '"Name":"[^"]*"' | head -1 | cut -d'"' -f4)
+      state=$(echo "$obj" | grep -o '"State":"[^"]*"' | head -1 | cut -d'"' -f4)
+      health_val=$(echo "$obj" | grep -o '"Health":"[^"]*"' | head -1 | cut -d'"' -f4)
+      running_for=$(echo "$obj" | grep -o '"RunningFor":"[^"]*"' | head -1 | cut -d'"' -f4)
+      published=$(echo "$obj" | grep -o '"Publishers":\[[^]]*\]' | head -1 | grep -o '"PublishedPort":[0-9]*' | cut -d: -f2 | sort -u | tr '\n' ',' | sed 's/,$//')
+
+      [[ -z "$health_val" ]] && health_val="-"
+      [[ -z "$running_for" ]] && running_for="-"
+      [[ -z "$published" || "$published" == "0" ]] && published="-"
+
+      local color="$GN"
+      [[ "$state" == "running" ]] || color="$RD"
+
+      printf " %-20s ${color}%-12s${CL} %-10s %-12s %s\n" \
+        "${name:-$svc}" "$state" "$health_val" "$running_for" "$published"
+    done <<< "$json"
+  done
+  echo
+}
+
+cmd_logs() {
+  local svc="${1:-}"
+  require_service_arg "$svc"
+  require_installed "$svc"
+  shift
+  compose "$svc" logs "$@"
+}
+
+cmd_restart() {
+  local svc="${1:-}"
+  require_service_arg "$svc"
+  require_installed "$svc"
+
+  header "Restarting $svc"
+  compose "$svc" restart
+  msg "$svc restarted"
+}
+
+cmd_backup() {
+  local targets=()
+  if [[ -n "${1:-}" ]]; then
+    targets=("$1")
+  else
+    read -ra targets <<< "$(installed_services)"
+    [[ ${#targets[@]} -gt 0 ]] || err "No services installed."
+  fi
+
+  for svc in "${targets[@]}"; do
+    require_installed "$svc"
+    header "Backing up $svc"
+
+    local volumes
+    volumes=$(compose "$svc" config --volumes 2>/dev/null) || true
+
+    if [[ -z "$volumes" ]]; then
+      info "No named volumes for $svc — skipping"
+      continue
+    fi
+
+    local date_tag
+    date_tag=$(date +%Y%m%d-%H%M%S)
+    local backup_dir="$BACKUPS_DIR/$svc"
+    mkdir -p "$backup_dir"
+
+    local project
+    project=$(compose "$svc" config --format json 2>/dev/null | grep -o '"name":"[^"]*"' | head -1 | cut -d'"' -f4)
+    [[ -z "$project" ]] && project="$svc"
+
+    while IFS= read -r vol; do
+      [[ -z "$vol" ]] && continue
+      local full_vol="${project}_${vol}"
+      local archive="$backup_dir/${vol}_${date_tag}.tar.gz"
+
+      info "Backing up volume $full_vol …"
+      docker run --rm \
+        -v "${full_vol}:/data:ro" \
+        -v "$backup_dir:/backup" \
+        alpine tar czf "/backup/${vol}_${date_tag}.tar.gz" -C /data . 2>/dev/null \
+        && msg "Saved $archive" \
+        || warn "Failed to back up $full_vol (volume may not exist)"
+    done <<< "$volumes"
+  done
+}
+
+cmd_list() {
+  header "Installed Services"
+
+  local services
+  read -ra services <<< "$(installed_services)"
+
+  if [[ ${#services[@]} -eq 0 ]]; then
+    info "No services installed."
+    echo
+    info "Available:"
+    for name in "${!REGISTRY[@]}"; do
+      echo -e "   ${BL}$name${CL}  →  ${REGISTRY[$name]}"
+    done
+    echo
+    return 0
+  fi
+
+  printf "\n ${BD}%-20s %s${CL}\n" "SERVICE" "REPO"
+  printf " %-20s %s\n" "-------" "----"
+
+  for svc in "${services[@]}"; do
+    local remote
+    remote=$(git -C "$(service_dir "$svc")" remote get-url origin 2>/dev/null || echo "-")
+    printf " %-20s %s\n" "$svc" "$remote"
+  done
+  echo
+}
+
+cmd_help() {
+  echo -e "\n${BD}homelab${CL} — unified service management\n"
+  echo "Usage:  homelab <command> [args]"
+  echo ""
+  printf "  ${GN}%-28s${CL} %s\n" "install <service>"   "Clone, configure, and start a service"
+  printf "  ${GN}%-28s${CL} %s\n" "update [service]"    "Pull latest and rebuild (all if omitted)"
+  printf "  ${GN}%-28s${CL} %s\n" "remove <service>"    "Stop and optionally delete a service"
+  printf "  ${GN}%-28s${CL} %s\n" "status"              "Show state of all services"
+  printf "  ${GN}%-28s${CL} %s\n" "logs <service> [-f]" "Tail service logs"
+  printf "  ${GN}%-28s${CL} %s\n" "restart <service>"   "Restart a service"
+  printf "  ${GN}%-28s${CL} %s\n" "backup [service]"    "Snapshot volumes to /opt/backups/"
+  printf "  ${GN}%-28s${CL} %s\n" "list"                "List installed services"
+  printf "  ${GN}%-28s${CL} %s\n" "help"                "Show this help"
+  echo ""
+  echo "Available services:"
+  for name in $(echo "${!REGISTRY[@]}" | tr ' ' '\n' | sort); do
+    echo -e "  ${BL}$name${CL}  →  ${REGISTRY[$name]}"
+  done
+  echo ""
+}
+
+# ── Main dispatch ────────────────────────────────────────────────────────────
+
+COMMAND="${1:-help}"
+shift || true
+
+case "$COMMAND" in
+  install) require_root; cmd_install "$@" ;;
+  update)  require_root; cmd_update  "$@" ;;
+  remove)  require_root; cmd_remove  "$@" ;;
+  status)  cmd_status  "$@" ;;
+  logs)    cmd_logs     "$@" ;;
+  restart) require_root; cmd_restart "$@" ;;
+  backup)  require_root; cmd_backup  "$@" ;;
+  list)    cmd_list    "$@" ;;
+  help|--help|-h) cmd_help ;;
+  *) err "Unknown command '$COMMAND'. Run: homelab help" ;;
+esac
