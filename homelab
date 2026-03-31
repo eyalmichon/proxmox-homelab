@@ -181,13 +181,23 @@ cmd_install() {
   [[ -n "$repo" ]] || err "Unknown service '$svc'. Known: ${!REGISTRY[*]}"
 
   local dest="$(service_dir "$svc")"
-  [[ ! -d "$dest" ]] || err "'$svc' already exists at $dest. Use 'homelab update $svc' instead."
+  local resuming=false
+
+  if [[ -d "$dest" ]]; then
+    if is_installed "$svc" && [[ -f "$dest/.env" ]]; then
+      err "'$svc' already exists at $dest. Use 'homelab update $svc' instead."
+    fi
+    info "Found incomplete install at $dest — resuming"
+    resuming=true
+  fi
 
   header "Installing $svc"
 
-  info "Cloning $repo …"
-  git clone --depth 1 "$repo" "$dest" 2>&1 | tail -1
-  msg "Cloned to $dest"
+  if ! $resuming; then
+    info "Cloning $repo …"
+    git clone --depth 1 "$repo" "$dest" 2>&1 | tail -1
+    msg "Cloned to $dest"
+  fi
 
   [[ -f "$dest/docker-compose.yml" ]] || err "Repo missing docker-compose.yml — not a compatible service."
 
