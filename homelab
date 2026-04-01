@@ -21,14 +21,23 @@ declare -A REGISTRY=(
   [magic-files]="https://github.com/eyalmichon/magic-files.git"
 )
 
-SERVICES_DIR="/opt/services"
-BACKUPS_DIR="/opt/backups"
+SERVICES_DIR="${SERVICES_DIR:-/opt/services}"
+BACKUPS_DIR="${BACKUPS_DIR:-/opt/backups}"
 SELF_URL="https://raw.githubusercontent.com/eyalmichon/proxmox-homelab/main/homelab"
 
 # ── Utility functions ────────────────────────────────────────────────────────
 
 require_root() {
   [[ $(id -u) -eq 0 ]] || err "Run as root."
+}
+
+require_cmd() {
+  command -v "$1" &>/dev/null || err "'$1' is required but not installed."
+}
+
+require_compose() {
+  require_cmd docker
+  docker compose version &>/dev/null || err "Docker Compose plugin is required."
 }
 
 require_service_arg() {
@@ -39,9 +48,28 @@ service_dir() {
   echo "$SERVICES_DIR/$1"
 }
 
+trim() {
+  local s="$1"
+  s="${s#"${s%%[![:space:]]*}"}"
+  s="${s%"${s##*[![:space:]]}"}"
+  printf '%s\n' "$s"
+}
+
 is_installed() {
   local dir="$SERVICES_DIR/$1"
-  [[ -d "$dir" && -f "$dir/docker-compose.yml" ]]
+  [[ -d "$dir" ]] && [[ -f "$dir/.homelab-installed" || -f "$dir/docker-compose.yml" ]]
+}
+
+maybe_stamp_marker() {
+  local dir="$(service_dir "$1")"
+  [[ -f "$dir/.homelab-installed" ]] && return 0
+  if [[ -f "$dir/docker-compose.yml" ]] && compose "$1" ps -q 2>/dev/null | grep -q .; then
+    touch "$dir/.homelab-installed"
+    info "Migrated '$1' to new install tracking"
+  else
+    warn "'$1' looks incomplete — run 'homelab install $1' to finish setup"
+    return 1
+  fi
 }
 
 require_installed() {
@@ -55,7 +83,7 @@ compose() {
 
 run_hook() {
   local script="$(service_dir "$1")/scripts/$2"
-  if [[ -x "$script" ]]; then
+  if [[ -f "$script" ]]; then
     info "Running $2 …"
     bash "$script"
   fi
@@ -66,15 +94,17 @@ run_hook() {
 prompt_user() {
   local -n _result=$1
   local prompt="$2"
-  local flags="-r"
-  [[ "${3:-}" == "--secret" ]] && flags="-rs"
-  read ${flags}p "  ${prompt}: " _result </dev/tty
+  local -a flags=(-r)
+  [[ "${3:-}" == "--secret" ]] && flags+=(-s)
+  read "${flags[@]}" -p "  ${prompt}: " _result </dev/tty
   [[ "${3:-}" == "--secret" ]] && echo
 }
 
 installed_services() {
   for d in "$SERVICES_DIR"/*/; do
-    [[ -f "$d/docker-compose.yml" ]] && basename "$d"
+    if [[ -f "$d/.homelab-installed" || -f "$d/docker-compose.yml" ]]; then
+      basename "$d"
+    fi
   done
 }
 
@@ -90,8 +120,12 @@ resolve_targets() {
   fi
 }
 
-json_field() {
-  grep -o "\"$1\":\"[^\"]*\"" | head -1 | cut -d'"' -f4
+dotenv_escape() {
+  local v="$1"
+  v="${v//\\/\\\\}"
+  v="${v//\"/\\\"}"
+  v="${v//\$/\\\$}"
+  printf '%s\n' "$v"
 }
 
 # ── .env.example parser ─────────────────────────────────────────────────────
@@ -127,8 +161,7 @@ generate_env() {
 
     if [[ "$work" =~ ^#\ *([A-Za-z_][A-Za-z0-9_]*=) ]]; then
       commented=true
-      work="${work#\#}"
-      work="${work#"${work%%[![:space:]]*}"}"
+      work="$(trim "${work#\#}")"
     fi
 
     [[ "$work" =~ ^([A-Za-z_][A-Za-z0-9_]*)=(.*) ]] || continue
@@ -143,8 +176,7 @@ generate_env() {
     else
       default="$rest"
     fi
-    default="${default%"${default##*[![:space:]]}"}"
-    default="${default#"${default%%[![:space:]]*}"}"
+    default="$(trim "$default")"
 
     local prompt_text="$key"
     [[ -n "$description" ]] && prompt_text="$key ($description)"
@@ -169,7 +201,7 @@ generate_env() {
       value="${value:-$default}"
     fi
 
-    env_lines+=("$key='$value'")
+    env_lines+=("$key=\"$(dotenv_escape "$value")\"")
   done 3< "$example"
 
   printf '%s\n' "${env_lines[@]}" > "$target"
@@ -179,6 +211,8 @@ generate_env() {
 # ── Commands ─────────────────────────────────────────────────────────────────
 
 cmd_install() {
+  require_cmd git
+  require_compose
   local svc="${1:-}"
   require_service_arg "$svc"
 
@@ -190,7 +224,11 @@ cmd_install() {
 
   if [[ -d "$dest" ]]; then
     if compose "$svc" ps -q 2>/dev/null | grep -q .; then
-      err "'$svc' is already running at $dest. Use 'homelab update $svc' instead."
+      if [[ -f "$dest/.homelab-installed" ]]; then
+        err "'$svc' is already running at $dest. Use 'homelab update $svc' instead."
+      fi
+      info "Stopping incomplete containers …"
+      compose "$svc" down || true
     fi
     info "Found existing directory at $dest — resuming install"
     resuming=true
@@ -198,14 +236,23 @@ cmd_install() {
 
   header "Installing $svc"
 
+  local git_out
   if $resuming; then
     info "Pulling latest …"
-    git -C "$dest" pull --ff-only 2>&1 | tail -3
-    msg "Repository updated"
+    if git_out=$(git -C "$dest" pull --ff-only 2>&1); then
+      msg "Repository updated"
+    else
+      echo "$git_out" >&2
+      err "git pull failed for $svc"
+    fi
   else
     info "Cloning $repo …"
-    git clone --depth 1 "$repo" "$dest" 2>&1 | tail -1
-    msg "Cloned to $dest"
+    if git_out=$(git clone --depth 1 "$repo" "$dest" 2>&1); then
+      msg "Cloned to $dest"
+    else
+      echo "$git_out" >&2
+      err "git clone failed for $svc"
+    fi
   fi
 
   [[ -f "$dest/docker-compose.yml" ]] || err "Repo missing docker-compose.yml — not a compatible service."
@@ -215,10 +262,13 @@ cmd_install() {
 
   info "Starting containers …"
   compose "$svc" up -d
+  touch "$dest/.homelab-installed"
   msg "$svc installed and running"
 }
 
 cmd_update() {
+  require_cmd git
+  require_compose
   local targets=()
   resolve_targets targets "${1:-}"
 
@@ -226,16 +276,20 @@ cmd_update() {
     require_installed "$svc"
     local dest="$(service_dir "$svc")"
 
-    if [[ ! -f "$dest/.env" ]]; then
-      warn "$svc has no .env — run 'homelab install $svc' to finish setup"
+    if ! maybe_stamp_marker "$svc"; then
       continue
     fi
 
     header "Updating $svc"
 
     info "Pulling latest …"
-    git -C "$dest" pull --ff-only 2>&1 | tail -3
-    msg "Repository updated"
+    local git_out
+    if git_out=$(git -C "$dest" pull --ff-only 2>&1); then
+      msg "Repository updated"
+    else
+      echo "$git_out" >&2
+      err "git pull failed for $svc"
+    fi
 
     run_hook "$svc" "post-update.sh"
 
@@ -246,6 +300,7 @@ cmd_update() {
 }
 
 cmd_remove() {
+  require_compose
   local svc="${1:-}"
   require_service_arg "$svc"
   require_installed "$svc"
@@ -267,19 +322,23 @@ cmd_remove() {
   fi
   msg "Containers stopped"
 
+  local dest="$(service_dir "$svc")"
   local del_dir
-  prompt_user del_dir "Delete the repo directory $(service_dir "$svc")? [y/N]"
+  prompt_user del_dir "Delete the repo directory $dest? [y/N]"
   if [[ "${del_dir,,}" == "y" ]]; then
-    rm -rf "$(service_dir "$svc")"
+    rm -rf "$dest"
     msg "Directory removed"
   else
-    info "Directory kept at $(service_dir "$svc")"
+    rm -f "$dest/.homelab-installed"
+    info "Directory kept at $dest"
   fi
 
   msg "$svc removed"
 }
 
 cmd_status() {
+  require_compose
+  require_cmd jq
   header "Service Status"
 
   local services
@@ -295,9 +354,10 @@ cmd_status() {
 
   for svc in "${services[@]}"; do
     local json
+    # Failure here means compose can't reach the service -- treat as stopped
     json=$(compose "$svc" ps --format json 2>/dev/null) || true
 
-    if [[ -z "$json" ]]; then
+    if [[ -z "$json" || "$json" == "[]" ]]; then
       printf " %-20s ${RD}%-12s${CL} %-10s %-12s %s\n" "$svc" "stopped" "-" "-" "-"
       continue
     fi
@@ -306,16 +366,15 @@ cmd_status() {
       [[ -z "$obj" ]] && continue
 
       local name state health_val running_for published
-      name=$(echo "$obj"        | json_field Name)
-      state=$(echo "$obj"       | json_field State)
-      health_val=$(echo "$obj"  | json_field Health)
-      running_for=$(echo "$obj" | json_field RunningFor)
-      published=$(echo "$obj" | grep -o '"Publishers":\[[^]]*\]' | head -1 \
-        | grep -o '"PublishedPort":[0-9]*' | cut -d: -f2 | sort -u | tr '\n' ',' | sed 's/,$//')
+      name=$(jq -r '.Name // empty' <<< "$obj")
+      state=$(jq -r '.State // empty' <<< "$obj")
+      health_val=$(jq -r '.Health // empty' <<< "$obj")
+      running_for=$(jq -r '.RunningFor // empty' <<< "$obj")
+      published=$(jq -r '[.Publishers[]?.PublishedPort // empty | select(. > 0)] | unique | map(tostring) | join(",")' <<< "$obj")
 
       [[ -z "$health_val" ]] && health_val="-"
       [[ -z "$running_for" ]] && running_for="-"
-      [[ -z "$published" || "$published" == "0" ]] && published="-"
+      [[ -z "$published" ]] && published="-"
 
       local color="$GN"
       [[ "$state" == "running" ]] || color="$RD"
@@ -328,6 +387,7 @@ cmd_status() {
 }
 
 cmd_logs() {
+  require_compose
   local svc="${1:-}"
   require_service_arg "$svc"
   require_installed "$svc"
@@ -336,6 +396,7 @@ cmd_logs() {
 }
 
 cmd_restart() {
+  require_compose
   local svc="${1:-}"
   require_service_arg "$svc"
   require_installed "$svc"
@@ -346,6 +407,8 @@ cmd_restart() {
 }
 
 cmd_backup() {
+  require_compose
+  require_cmd jq
   local targets=()
   resolve_targets targets "${1:-}"
 
@@ -354,6 +417,7 @@ cmd_backup() {
     header "Backing up $svc"
 
     local volumes
+    # --volumes may fail if compose file is invalid; treat as "no volumes"
     volumes=$(compose "$svc" config --volumes 2>/dev/null) || true
 
     if [[ -z "$volumes" ]]; then
@@ -361,32 +425,45 @@ cmd_backup() {
       continue
     fi
 
+    docker image inspect alpine &>/dev/null || {
+      info "Pulling alpine image (first-time only) …"
+      docker pull alpine
+    }
+
     local date_tag
     date_tag=$(date +%Y%m%d-%H%M%S)
     local backup_dir="$BACKUPS_DIR/$svc"
     mkdir -p "$backup_dir"
 
     local project
-    project=$(compose "$svc" config --format json 2>/dev/null | json_field name)
+    project=$(compose "$svc" config --format json 2>/dev/null | jq -r '.name // empty')
     [[ -z "$project" ]] && project="$svc"
 
     while IFS= read -r vol; do
       [[ -z "$vol" ]] && continue
       local full_vol="${project}_${vol}"
+      if ! docker volume inspect "$full_vol" &>/dev/null; then
+        full_vol="$vol"
+        if ! docker volume inspect "$full_vol" &>/dev/null; then
+          warn "Volume $vol not found — skipping"
+          continue
+        fi
+      fi
       local archive="$backup_dir/${vol}_${date_tag}.tar.gz"
 
       info "Backing up volume $full_vol …"
       docker run --rm \
         -v "${full_vol}:/data:ro" \
         -v "$backup_dir:/backup" \
-        alpine tar czf "/backup/${vol}_${date_tag}.tar.gz" -C /data . 2>/dev/null \
+        alpine tar czf "/backup/${vol}_${date_tag}.tar.gz" -C /data . \
         && msg "Saved $archive" \
-        || warn "Failed to back up $full_vol (volume may not exist)"
+        || warn "Failed to back up $full_vol"
     done <<< "$volumes"
   done
 }
 
 cmd_list() {
+  require_cmd git
   header "Installed Services"
 
   local services
@@ -415,17 +492,20 @@ cmd_list() {
 }
 
 cmd_self_update() {
+  require_cmd wget
   header "Updating homelab CLI"
   local tmp
   tmp=$(mktemp)
-  if wget -qO "$tmp" "$SELF_URL"; then
-    mv "$tmp" /usr/local/bin/homelab
-    chmod +x /usr/local/bin/homelab
-    msg "homelab CLI updated"
-  else
-    rm -f "$tmp"
-    err "Download failed — check your internet connection"
+  trap 'rm -f "$tmp"' RETURN
+  wget -qO "$tmp" "$SELF_URL" || err "Download failed — check your internet connection"
+  [[ -s "$tmp" ]] || err "Downloaded file is empty"
+  head -1 "$tmp" | grep -q '^#!/' || err "Downloaded file is not a valid script"
+  if cmp -s "$tmp" /usr/local/bin/homelab; then
+    msg "Already up to date"
+    return 0
   fi
+  install -m 0755 "$tmp" /usr/local/bin/homelab
+  msg "homelab CLI updated"
 }
 
 cmd_help() {
@@ -452,8 +532,10 @@ cmd_help() {
 
 # ── Main dispatch ────────────────────────────────────────────────────────────
 
+[[ "${BASH_SOURCE[0]}" == "${0}" ]] || return 0
+
 COMMAND="${1:-help}"
-shift || true
+(( $# )) && shift
 
 case "$COMMAND" in
   install)     require_root; cmd_install     "$@" ;;
