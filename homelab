@@ -97,7 +97,7 @@ prompt_user() {
   local -a flags=(-r)
   [[ "${3:-}" == "--secret" ]] && flags+=(-s)
   read "${flags[@]}" -p "  ${prompt}: " _result </dev/tty
-  [[ "${3:-}" == "--secret" ]] && echo
+  if [[ "${3:-}" == "--secret" ]]; then echo; fi
 }
 
 installed_services() {
