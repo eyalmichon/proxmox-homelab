@@ -264,6 +264,12 @@ cmd_install() {
   compose "$svc" up -d
   touch "$dest/.homelab-installed"
   msg "$svc installed and running"
+
+  local notes="$dest/INSTALL_NOTES"
+  if [[ -f "$notes" ]]; then
+    echo ""
+    cat "$notes"
+  fi
 }
 
 cmd_update() {
