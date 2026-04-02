@@ -44,6 +44,26 @@ require_service_arg() {
   [[ -n "${1:-}" ]] || err "Usage: homelab $COMMAND <service>"
 }
 
+validate_service_name() {
+  [[ "$1" =~ ^[a-zA-Z0-9_-]+$ ]] || err "Invalid service name '$1'. Only letters, digits, hyphens, and underscores allowed."
+}
+
+parse_service_arg() {
+  local arg="${1:-}"
+  SVC="${arg%%@*}"
+  VERSION="${arg#*@}"
+  if [[ "$VERSION" == "$arg" ]]; then VERSION=""; fi
+  [[ -n "$SVC" ]] && validate_service_name "$SVC"
+  return 0
+}
+
+current_ref() {
+  local dir="$(service_dir "$1")"
+  local tag
+  tag=$(git -C "$dir" describe --tags --exact-match 2>/dev/null) && { echo "$tag"; return; }
+  git -C "$dir" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "-"
+}
+
 service_dir() {
   echo "$SERVICES_DIR/$1"
 }
@@ -205,6 +225,7 @@ generate_env() {
   done 3< "$example"
 
   printf '%s\n' "${env_lines[@]}" > "$target"
+  chmod 600 "$target"
   msg ".env written (${#env_lines[@]} variables)"
 }
 
@@ -213,7 +234,8 @@ generate_env() {
 cmd_install() {
   require_cmd git
   require_compose
-  local svc="${1:-}"
+  parse_service_arg "${1:-}"
+  local svc="$SVC" version="$VERSION"
   require_service_arg "$svc"
 
   local repo="${REGISTRY[$svc]:-}"
@@ -234,20 +256,34 @@ cmd_install() {
     resuming=true
   fi
 
-  header "Installing $svc"
+  header "Installing $svc${version:+ @ $version}"
 
   local git_out
   if $resuming; then
-    info "Pulling latest …"
-    if git_out=$(git -C "$dest" pull --ff-only 2>&1); then
-      msg "Repository updated"
+    if [[ -n "$version" ]]; then
+      info "Fetching $version …"
+      if git_out=$(git -C "$dest" fetch --depth 1 origin tag "$version" 2>&1) \
+         && git_out+=$'\n'$(git -C "$dest" checkout "$version" 2>&1); then
+        msg "Checked out $version"
+      else
+        echo "$git_out" >&2
+        err "git checkout failed for $svc@$version"
+      fi
     else
-      echo "$git_out" >&2
-      err "git pull failed for $svc"
+      info "Pulling latest …"
+      if git_out=$(git -C "$dest" pull --ff-only 2>&1); then
+        msg "Repository updated"
+      else
+        echo "$git_out" >&2
+        err "git pull failed for $svc"
+      fi
     fi
   else
-    info "Cloning $repo …"
-    if git_out=$(git clone --depth 1 "$repo" "$dest" 2>&1); then
+    local -a clone_args=(--depth 1)
+    [[ -n "$version" ]] && clone_args+=(--branch "$version")
+
+    info "Cloning $repo${version:+ @ $version} …"
+    if git_out=$(git clone "${clone_args[@]}" "$repo" "$dest" 2>&1); then
       msg "Cloned to $dest"
     else
       echo "$git_out" >&2
@@ -275,8 +311,11 @@ cmd_install() {
 cmd_update() {
   require_cmd git
   require_compose
+  local raw="${1:-}"
+  parse_service_arg "$raw"
+  local version="$VERSION"
   local targets=()
-  resolve_targets targets "${1:-}"
+  resolve_targets targets "${SVC:-}"
 
   for svc in "${targets[@]}"; do
     require_installed "$svc"
@@ -286,15 +325,26 @@ cmd_update() {
       continue
     fi
 
-    header "Updating $svc"
+    header "Updating $svc${version:+ → $version}"
 
-    info "Pulling latest …"
     local git_out
-    if git_out=$(git -C "$dest" pull --ff-only 2>&1); then
-      msg "Repository updated"
+    if [[ -n "$version" ]]; then
+      info "Fetching $version …"
+      if git_out=$(git -C "$dest" fetch --depth 1 origin tag "$version" 2>&1) \
+         && git_out+=$'\n'$(git -C "$dest" checkout "$version" 2>&1); then
+        msg "Checked out $version"
+      else
+        echo "$git_out" >&2
+        err "git checkout failed for $svc@$version"
+      fi
     else
-      echo "$git_out" >&2
-      err "git pull failed for $svc"
+      info "Pulling latest …"
+      if git_out=$(git -C "$dest" pull --ff-only 2>&1); then
+        msg "Repository updated"
+      else
+        echo "$git_out" >&2
+        err "git pull failed for $svc"
+      fi
     fi
 
     run_hook "$svc" "post-update.sh"
@@ -355,16 +405,18 @@ cmd_status() {
     return 0
   fi
 
-  printf "\n ${BD}%-20s %-12s %-10s %-12s %s${CL}\n" "SERVICE" "STATE" "HEALTH" "UPTIME" "PORTS"
-  printf " %-20s %-12s %-10s %-12s %s\n" "-------" "-----" "------" "------" "-----"
+  printf "\n ${BD}%-20s %-10s %-12s %-10s %-12s %s${CL}\n" "SERVICE" "VERSION" "STATE" "HEALTH" "UPTIME" "PORTS"
+  printf " %-20s %-10s %-12s %-10s %-12s %s\n" "-------" "-------" "-----" "------" "------" "-----"
 
   for svc in "${services[@]}"; do
+    local ref
+    ref=$(current_ref "$svc")
+
     local json
-    # Failure here means compose can't reach the service -- treat as stopped
     json=$(compose "$svc" ps --format json 2>/dev/null) || true
 
     if [[ -z "$json" || "$json" == "[]" ]]; then
-      printf " %-20s ${RD}%-12s${CL} %-10s %-12s %s\n" "$svc" "stopped" "-" "-" "-"
+      printf " %-20s %-10s ${RD}%-12s${CL} %-10s %-12s %s\n" "$svc" "$ref" "stopped" "-" "-" "-"
       continue
     fi
 
@@ -385,8 +437,8 @@ cmd_status() {
       local color="$GN"
       [[ "$state" == "running" ]] || color="$RD"
 
-      printf " %-20s ${color}%-12s${CL} %-10s %-12s %s\n" \
-        "${name:-$svc}" "$state" "$health_val" "$running_for" "$published"
+      printf " %-20s %-10s ${color}%-12s${CL} %-10s %-12s %s\n" \
+        "${name:-$svc}" "$ref" "$state" "$health_val" "$running_for" "$published"
     done <<< "$json"
   done
   echo
@@ -486,14 +538,50 @@ cmd_list() {
     return 0
   fi
 
-  printf "\n ${BD}%-20s %s${CL}\n" "SERVICE" "REPO"
-  printf " %-20s %s\n" "-------" "----"
+  printf "\n ${BD}%-20s %-10s %s${CL}\n" "SERVICE" "VERSION" "REPO"
+  printf " %-20s %-10s %s\n" "-------" "-------" "----"
 
   for svc in "${services[@]}"; do
-    local remote
+    local ref remote
+    ref=$(current_ref "$svc")
     remote=$(git -C "$(service_dir "$svc")" remote get-url origin 2>/dev/null || echo "-")
-    printf " %-20s %s\n" "$svc" "$remote"
+    printf " %-20s %-10s %s\n" "$svc" "$ref" "$remote"
   done
+  echo
+}
+
+cmd_versions() {
+  require_cmd git
+  local svc="${1:-}"
+  require_service_arg "$svc"
+  validate_service_name "$svc"
+
+  local repo="${REGISTRY[$svc]:-}"
+  [[ -n "$repo" ]] || err "Unknown service '$svc'. Known: ${!REGISTRY[*]}"
+
+  header "Available versions for $svc"
+
+  local tags
+  tags=$(git ls-remote --tags --refs "$repo" 2>/dev/null \
+    | sed 's|.*/||' | sort -rV)
+
+  if [[ -z "$tags" ]]; then
+    info "No tagged releases found. Use 'homelab install $svc' for latest main."
+    return 0
+  fi
+
+  local current=""
+  if is_installed "$svc"; then
+    current=$(current_ref "$svc")
+  fi
+
+  while IFS= read -r tag; do
+    if [[ "$tag" == "$current" ]]; then
+      echo -e "  ${GN}$tag${CL}  ← installed"
+    else
+      echo "  $tag"
+    fi
+  done <<< "$tags"
   echo
 }
 
@@ -518,16 +606,17 @@ cmd_help() {
   echo -e "\n${BD}homelab${CL} — unified service management\n"
   echo "Usage:  homelab <command> [args]"
   echo ""
-  printf "  ${GN}%-28s${CL} %s\n" "install <service>"   "Clone, configure, and start a service"
-  printf "  ${GN}%-28s${CL} %s\n" "update [service]"    "Pull latest and rebuild (all if omitted)"
-  printf "  ${GN}%-28s${CL} %s\n" "remove <service>"    "Stop and optionally delete a service"
-  printf "  ${GN}%-28s${CL} %s\n" "status"              "Show state of all services"
-  printf "  ${GN}%-28s${CL} %s\n" "logs <service> [-f]" "Tail service logs"
-  printf "  ${GN}%-28s${CL} %s\n" "restart <service>"   "Restart a service"
-  printf "  ${GN}%-28s${CL} %s\n" "backup [service]"    "Snapshot volumes to /opt/backups/"
-  printf "  ${GN}%-28s${CL} %s\n" "list"                "List installed services"
-  printf "  ${GN}%-28s${CL} %s\n" "self-update"         "Update the homelab CLI itself"
-  printf "  ${GN}%-28s${CL} %s\n" "help"                "Show this help"
+  printf "  ${GN}%-28s${CL} %s\n" "install <svc[@version]>" "Clone, configure, and start a service (pin to tag)"
+  printf "  ${GN}%-28s${CL} %s\n" "update [svc[@version]]"  "Pull latest and rebuild (all if omitted)"
+  printf "  ${GN}%-28s${CL} %s\n" "remove <service>"        "Stop and optionally delete a service"
+  printf "  ${GN}%-28s${CL} %s\n" "status"                  "Show state of all services"
+  printf "  ${GN}%-28s${CL} %s\n" "logs <service> [-f]"     "Tail service logs"
+  printf "  ${GN}%-28s${CL} %s\n" "restart <service>"       "Restart a service"
+  printf "  ${GN}%-28s${CL} %s\n" "backup [service]"        "Snapshot volumes to /opt/backups/"
+  printf "  ${GN}%-28s${CL} %s\n" "list"                    "List installed services"
+  printf "  ${GN}%-28s${CL} %s\n" "versions <service>"      "List available tagged releases"
+  printf "  ${GN}%-28s${CL} %s\n" "self-update"             "Update the homelab CLI itself"
+  printf "  ${GN}%-28s${CL} %s\n" "help"                    "Show this help"
   echo ""
   echo "Available services:"
   for name in $(echo "${!REGISTRY[@]}" | tr ' ' '\n' | sort); do
@@ -553,6 +642,7 @@ case "$COMMAND" in
   backup)      require_root; cmd_backup      "$@" ;;
   self-update) require_root; cmd_self_update "$@" ;;
   list)                      cmd_list        "$@" ;;
+  versions)                  cmd_versions    "$@" ;;
   help|--help|-h)            cmd_help             ;;
   *) err "Unknown command '$COMMAND'. Run: homelab help" ;;
 esac

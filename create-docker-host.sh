@@ -24,7 +24,7 @@ RAM="1024"
 CORES="2"
 STORAGE="local-lvm"
 BRIDGE="vmbr0"
-PASSWORD="$(openssl rand -base64 12 2>/dev/null || echo "changeme123")"
+PASSWORD="$(openssl rand -base64 12)" || { echo "ERROR: openssl is required to generate a password."; exit 1; }
 
 # ── Gather settings ──────────────────────────────────────────────────────────
 header "Docker Host LXC Setup"
