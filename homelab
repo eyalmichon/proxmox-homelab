@@ -297,6 +297,7 @@ cmd_install() {
   run_hook "$svc" "post-install.sh"
 
   info "Starting containers …"
+  compose "$svc" pull 2>/dev/null || true
   compose "$svc" up -d
   touch "$dest/.homelab-installed"
   msg "$svc installed and running"
@@ -350,6 +351,7 @@ cmd_update() {
     run_hook "$svc" "post-update.sh"
 
     info "Rebuilding containers …"
+    compose "$svc" pull 2>/dev/null || true
     compose "$svc" up -d --build
     msg "$svc updated"
   done
