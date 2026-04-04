@@ -468,7 +468,6 @@ cmd_restart() {
 
 cmd_backup() {
   require_compose
-  require_cmd jq
   local targets=()
   resolve_targets targets "${1:-}"
 
@@ -496,7 +495,7 @@ cmd_backup() {
     mkdir -p "$backup_dir"
 
     local project
-    project=$(compose "$svc" config --format json 2>/dev/null | jq -r '.name // empty')
+    project=$(compose "$svc" config 2>/dev/null | awk '/^name:/{print $2; exit}')
     [[ -z "$project" ]] && project="$svc"
 
     while IFS= read -r vol; do
